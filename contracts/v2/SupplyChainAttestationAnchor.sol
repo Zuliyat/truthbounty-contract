@@ -8,6 +8,7 @@ import { ISupplyChainAttestations } from "./interfaces/ISupplyChainAttestations.
 import { IV2Module } from "./interfaces/IV2Module.sol";
 import { V2Errors } from "./libraries/V2Errors.sol";
 import { V2SafeCast } from "./libraries/V2SafeCast.sol";
+import { V2SubmoduleProvenance } from "./libraries/V2SubmoduleProvenance.sol";
 
 /// @title SupplyChainAttestationAnchor
 /// @notice Read-only discovery anchor that publishes the authoritative
@@ -19,12 +20,24 @@ import { V2SafeCast } from "./libraries/V2SafeCast.sol";
 ///         `SupplyChainAttestationPublished` event; no off-chain actor gains any
 ///         settlement or treasury authority from this contract.
 contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestations {
+    /// @notice Canonical SBOM/attestation schema identifier for release provenance.
+    string public constant SBOM_FORMAT = "CycloneDX-1.5+in-toto/SLSA-v1";
+
+    /// @notice Predicate type URI for the release SBOM attestation.
+    string public constant SBOM_PREDICATE_TYPE =
+        "https://truthbounty.protocol/attestation/release-sbom/v1";
+
     /// @notice Schema version for the attestation format.
     uint16 public constant ATTESTATION_SCHEMA_VERSION = 1;
 
     /// @notice Predicate type URI for in-toto / SLSA provenance attestations.
     string public constant PREDICATE_TYPE =
         "https://truthbounty.protocol/attestation/contract-release/v1";
+
+    /// @notice Number of pinned submodule dependencies required for a valid release.
+    /// @dev PREWAVE-SC-067: forge-std, OpenZeppelin, and nested submodules must all be
+    ///      declared with immutable URL + SHA + license provenance before build.
+    uint256 public constant MIN_PINNED_SUBMODULES = 3;
 
     /// @notice The immutable attestation fields for this deployment.
     /// @dev Written once in the constructor and never mutated (strings, arrays and structs cannot be `immutable`);
@@ -62,6 +75,13 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
     /// @dev Each material is encoded as: uri|digest
     string[] private _materialData;
 
+    /// @notice Immutable digest of the canonical SBOM document.
+    /// @dev Binds the on-chain anchor to the exact CycloneDX SBOM bytes.
+    bytes32 private _sbomDigest;
+
+    /// @notice Immutable digest of the in-toto/SLSA provenance envelope.
+    bytes32 private _provenanceDigest;
+
     bytes32 private immutable _checksum;
 
     /// @param attestation_ The validated attestation record to publish.
@@ -88,6 +108,18 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
         if (attestation_.checksum == bytes32(0)) {
             revert V2Errors.InvalidChecksum();
         }
+        if (attestation_.sbomDigest == bytes32(0)) {
+            revert V2Errors.InvalidChecksum();
+        }
+        if (attestation_.provenanceDigest == bytes32(0)) {
+            revert V2Errors.InvalidChecksum();
+        }
+        // PREWAVE-SC-067: enforce immutable recursive dependency graph and reject
+        // dirty/substituted content, missing nested modules, and license mismatch
+        // before the anchor is deployed.
+        if (!V2SubmoduleProvenance.verifyDependencyGraph(attestation_.dependencies, MIN_PINNED_SUBMODULES)) {
+            revert V2Errors.InvalidSubmoduleProvenance();
+        }
 
         _protocol = attestation_.protocol;
         _releaseVersion = attestation_.releaseVersion;
@@ -103,6 +135,12 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
         _subjectData = packSubjects(attestation_.subjects);
         _materialData = packMaterials(attestation_.materials);
         _checksum = attestation_.checksum;
+        _sbomDigest = attestation_.sbomDigest;
+        _provenanceDigest = attestation_.provenanceDigest;
+
+        // PREWAVE-SC-067: emit release attestation recording pinned submodule SHAs
+        // so off-chain verifiers can reconstruct the immutable dependency graph.
+        emit SubmoduleProvenancePinned(attestation_.dependencies);
 
         emit SupplyChainAttestationPublished(attestation_);
     }
@@ -120,13 +158,32 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
             workflowIdentity: _workflowIdentity,
             subjects: unpackSubjects(_subjectData),
             materials: unpackMaterials(_materialData),
-            checksum: _checksum
+            checksum: _checksum,
+            sbomDigest: _sbomDigest,
+            provenanceDigest: _provenanceDigest
         });
+    }
+
+    /// @notice Returns the pinned submodule dependency graph for release attestation.
+    /// @dev PREWAVE-SC-067: exposes the immutable dependency list so verifiers can
+    ///      confirm URLs/SHAs/licenses without trusting off-chain manifests.
+    function pinnedSubmodules() external view returns (ISupplyChainAttestations.DependencyEntry[] memory) {
+        return unpackDependencies(_dependencyData);
     }
 
     /// @notice Immutable protocol version marker shared by canonical V2 modules.
     function protocolVersion() external pure override returns (uint16 major, uint16 minor) {
         return (2, 0);
+    }
+
+    /// @notice Returns the canonical SBOM format identifier.
+    function sbomFormat() external pure returns (string memory) {
+        return SBOM_FORMAT;
+    }
+
+    /// @notice Returns the predicate type URI for the release SBOM attestation.
+    function sbomPredicateType() external pure returns (string memory) {
+        return SBOM_PREDICATE_TYPE;
     }
 
     /// @notice ERC-165: advertises ISupplyChainAttestations, IV2Module, and ERC-165.
@@ -135,6 +192,10 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
             || interfaceId == type(IV2Module).interfaceId
             || super.supportsInterface(interfaceId);
     }
+
+    /// @notice Emitted when the pinned submodule dependency graph is recorded.
+    /// @dev PREWAVE-SC-067: release attestation records SHAs for all pinned modules.
+    event SubmoduleProvenancePinned(ISupplyChainAttestations.DependencyEntry[] dependencies);
 
     /// @dev Validates 40-character lowercase hex source commit.
     function isValidSourceCommit(string memory commit) internal pure returns (bool) {
@@ -148,6 +209,13 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
             }
         }
         return true;
+    }
+
+    /// @dev PREWAVE-SC-067: rejects any dependency whose integrity field is not a
+    ///      full 40-char commit SHA, preventing substituted or dirty content from
+    ///      being recorded in the immutable dependency graph.
+    function _requirePinnedRev(string memory rev) internal pure returns (bool) {
+        return isValidSourceCommit(rev);
     }
 
     /// @dev V2-SC-160: a delimiter-joined record is injective only if no variable-length field
@@ -173,6 +241,10 @@ contract SupplyChainAttestationAnchor is ERC165, IV2Module, ISupplyChainAttestat
             _requireNoDelimiter(deps[i].kind);
             _requireNoDelimiter(deps[i].rev);
             _requireNoDelimiter(deps[i].integrity);
+            // PREWAVE-SC-067: every dependency must carry a pinned commit SHA.
+            if (!_requirePinnedRev(deps[i].rev)) {
+                revert V2Errors.InvalidSubmoduleProvenance();
+            }
             packed[i] = string(
                 abi.encodePacked(
                     deps[i].name, "|",

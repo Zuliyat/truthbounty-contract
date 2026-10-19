@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.28;
 
+import {UntrackedAssetRecovery} from "../recovery/UntrackedAssetRecovery.sol";
+
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
@@ -12,7 +14,7 @@ import "../interfaces/ITruthBountyEvents.sol";
 import "../IReputationOracle.sol";
 import "../treasury/ITreasuryAccounting.sol";
 
-contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBountyEvents {
+contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBountyEvents, UntrackedAssetRecovery {
     using SafeERC20 for IERC20;
     // ============ Roles ============
 
@@ -307,7 +309,10 @@ contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBou
         if (verifier == address(0)) revert ZeroVerifier();
         if (effectiveStake == 0) revert ZeroStake();
 
-        uint256 reputationScore = _getReputationScore(verifier);
+        // CEI: INTERACTION first — the oracle call is external and wrapped in
+        // try/catch.  All pure arithmetic is performed on the returned values.
+        // State is only mutated after every external call is complete.
+        uint256 reputationScore = _getReputationScore(verifier); // external call (try/catch)
 
         uint256 reputationMultiplier = _calculateReputationMultiplier(reputationScore);
         uint256 difficultyMultiplier = _getCategoryMultiplier(category);
@@ -325,8 +330,10 @@ contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBou
         if (finalAmount < minReward) finalAmount = minReward;
         if (finalAmount > maxReward) finalAmount = maxReward;
 
+        // CHECKS: enforce emission caps before any state write.
         _enforceEmissionCaps(verifier, finalAmount);
 
+        // EFFECTS: all state writes occur after the external oracle call and all checks.
         calculationId = keccak256(abi.encode(
             verifier, effectiveStake, activeStake, category, block.timestamp, calculationCount
         ));
@@ -519,6 +526,7 @@ contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBou
         if (newToken == address(0)) revert RewardTokenNotConfigured();
 
         address oldToken = address(rewardToken);
+        if (oldToken != address(0)) _protectRecoveryAsset(oldToken);
         rewardToken = IERC20(newToken);
 
         emit RewardTokenUpdated(oldToken, newToken);
@@ -534,8 +542,12 @@ contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBou
         }
         if (amount == 0) revert InvalidRewardAmount();
 
-        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        // CEI: EFFECT before INTERACTION — credit the ledger first so any
+        // callback through the inbound transferFrom observes the already-updated
+        // totalFunded and cannot create a double-fund anomaly.
         totalFunded += amount;
+
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
 
         emit RewardPoolFunded(
             msg.sender,
@@ -1097,5 +1109,20 @@ contract RewardEngine is ReentrancyGuard, Pausable, GovernanceOwnable, ITruthBou
             EVENT_SCHEMA_VERSION
 
         );
+    }
+
+    // V2-SC-154: additive recovery only; existing liability and authority paths remain authoritative.
+    function _checkAssetRecoveryAuthority() internal view override {
+        if (!hasRole(GOVERNANCE_ROLE, msg.sender) || !governanceEnabled) revert RecoveryAuthorityUnavailable();
+    }
+
+    function _requireAssetRecoveryAllowed() internal view override {
+        if (paused()) revert RecoveryPaused();
+    }
+
+    function _reservedAssetBalance(address asset) internal view override returns (uint256) {
+        // The balance-backed funding pool includes unallocated and deferred rewards.
+        // Historical reward assets remain protected after token configuration changes.
+        return asset == address(rewardToken) || _isProtectedRecoveryAsset(asset) ? IERC20(asset).balanceOf(address(this)) : 0;
     }
 }
